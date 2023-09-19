@@ -1,40 +1,149 @@
-from peft import LoraConfig, PeftModel
+from peft import LoraConfig, PeftModel, prepare_model_for_int8_training, get_peft_model
 from trl import SFTTrainer
 import pdb
-from MWDatasets import MWDataset_turn
+from MWDatasets import MWDataset_dial, MWDataset_turn
 import datasets
 import os
 import torch
 import logging
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, pipeline
-
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, pipeline,  EvalPrediction
+import numpy as np
+import json
+from transformers import EarlyStoppingCallback
+from transformers import pipeline
+from transformers.pipelines.pt_utils import KeyDataset
+import datasets
+import random
+from tqdm import tqdm
+from utils.typo_fix import typo_fix
 
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_fn', type=str,
                     default="data/mw21_10p_train_v3.json",
                     help="training data file (few-shot or full shot)")
+parser.add_argument('--val_fn', type=str,
+                    default="data/mw21_100p_dev.json",
+                    help="training data file (few-shot or full shot)")
 parser.add_argument('--test_fn', type=str,
                     default="data/mw21_100p_test.json",
                     help="training data file (few-shot or full shot)")
-
 parser.add_argument('--base_model_name', type=str,
                     default='meta-llama/Llama-2-7b-chat-hf')
 
 parser.add_argument('--save_dir', type=str,
                     default='expts/debug')
-
+parser.add_argument('--save_model', type=int,
+                    default=1)
+parser.add_argument('--report', type=int,
+                    default=1)
+parser.add_argument('--seed', type=int,
+                    default=42)
+parser.add_argument('--log_step_num', type=int)
+parser.add_argument('--save_step_num', type=int)
+parser.add_argument('--epoch_num', type=float)
+parser.add_argument('--turn_level', type=int, default=1)
+parser.add_argument('--short_testing', type=int, default=0)
 
 args = parser.parse_args()
 
 
+# def compute_metrics(pred):
+#     global pred_result, gold_result
+#     labels = pred.label_ids
+#     preds = pred.predictions
+
+#     labels = np.where(labels != -100, labels, 0)
+#     labels = llama_tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+#     # preds to text
+
+#     # find maximuum logit
+#     preds = np.argmax(preds, axis=-1)
+#     preds = llama_tokenizer.batch_decode(preds, skip_special_tokens=True)
+#     jga = 0
+#     for l, p in zip(labels, preds):
+#         if l == p:
+#             jga += 1
+#     pred_result = preds
+#     gold_result = labels
+#     return {
+#         'jga': jga/len(labels)
+#     }
+
+
+def init_experiment(seed):
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    random.seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if use multi-GPU
+
+
+def generate_prompt(data_point):
+    return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.  # noqa: E501
+    ### Instruction:
+    {data_point["instruction"]}
+    ### Input:
+    {data_point["input"]}
+    ### Response:
+    {data_point["output"]}"""
+
+
+def compute_perplexity(p: torch.Tensor) -> torch.Tensor:
+    if isinstance(p, torch.Tensor):
+        return torch.exp(p)
+    elif isinstance(p, (float, int, np.float32)):
+        return torch.exp(torch.tensor(p))
+    else:
+        raise ValueError("Input must be a PyTorch tensor, float, or int")
+
+
+def compute_metrics(p: EvalPrediction) -> dict:
+    perplexity = compute_perplexity(p.predictions.mean())
+    return {"perplexity": perplexity.item()}
+
+
+def str_to_dict(result):
+    result_dict = {}
+    dsv = result.split('[s]')
+    for dsv_item in dsv:
+        if len(dsv_item.strip()) == 0:
+            continue
+        else:
+            dsv_item = dsv_item.strip()
+            d, s, v = dsv_item.split(
+                '-')[0], dsv_item.split('-')[1], dsv_item.split('-')[2]
+            ds = d + '-' + s
+            result_dict[ds] = v
+    return result_dict
+
+
 if __name__ == "__main__":
-    train_data = MWDataset_turn(args.train_fn).as_dict()
+    init_experiment(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
+    # save args
+    with open(f"{args.save_dir}/args.json", 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
+    print(args)
+    print("using turn level" if args.turn_level else "using dialog level")
+
+    Dataset = MWDataset_turn if args.turn_level else MWDataset_dial
+
+    train_data = MWDataset_turn(args.train_fn, 'train').as_dict()
     train_data = datasets.Dataset.from_dict(train_data)
     # train_loader = DataLoader(train_data, batch_size=4,
     #                           shuffle=False, collate_fn=train_data.collate_fn)
-    test_data = MWDataset_turn(args.train_fn).as_dict()
+    val_data = MWDataset_turn(args.val_fn, 'val').as_dict(
+        short=args.short_testing)
+    val_data = datasets.Dataset.from_dict(val_data)
+
+    test_data = MWDataset_turn(args.test_fn, 'test').as_dict(
+        short=args.short_testing)
     test_data = datasets.Dataset.from_dict(test_data)
+
     # test_loader = DataLoader(test_data, batch_size=4,
     #                          shuffle=False, collate_fn=test_data.collate_fn)
     # test_data = MWDataset_turn(args.test_fn)
@@ -58,7 +167,7 @@ if __name__ == "__main__":
         device_map={"": 0}
     )
     base_model.config.use_cache = False
-    base_model.config.pretraining_tp = 1
+    # base_model.config.pretraining_tp = 1
 
     # LoRA Config
     peft_parameters = LoraConfig(
@@ -66,17 +175,24 @@ if __name__ == "__main__":
         lora_dropout=0.1,
         r=8,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        inference_mode=False,
+        # target_modules=['q_proj','v_proj']
     )
+
     # Training Params
+    model = prepare_model_for_int8_training(base_model)
+    model = get_peft_model(model, peft_parameters)
+    model.print_trainable_parameters()
+
     train_params = TrainingArguments(
         output_dir=f"{args.save_dir}",
-        num_train_epochs=0.01,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=1,
+        num_train_epochs=args.epoch_num,
+        per_device_train_batch_size=16,
+        gradient_accumulation_steps=4,
         optim="paged_adamw_32bit",
-        save_steps=25,
-        logging_steps=25,
+        save_steps=args.save_step_num,
+        logging_steps=args.log_step_num,
         learning_rate=2e-4,
         weight_decay=0.001,
         fp16=False,
@@ -85,17 +201,69 @@ if __name__ == "__main__":
         max_steps=-1,
         warmup_ratio=0.03,
         group_by_length=True,
-        lr_scheduler_type="constant"
+        lr_scheduler_type="constant",
+        eval_steps=args.save_step_num,
+        load_best_model_at_end=True,
+        evaluation_strategy="steps",
+        run_name=args.save_dir,
+        report_to='wandb' if args.report else 'none'
     )
 
     fine_tuning = SFTTrainer(
-        model=base_model,
+        model=model,
         train_dataset=train_data,
+        eval_dataset=val_data,
+        compute_metrics=compute_metrics,
         peft_config=peft_parameters,
         dataset_text_field="text",
         tokenizer=llama_tokenizer,
-        args=train_params
+        args=train_params,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
+
     # Training
-    fine_tuning.train()
-    fine_tuning.model.save_pretrained(f"{args.save_dir}/model")
+    try:
+        fine_tuning.train(resume_from_checkpoint=True)
+    except ValueError:
+        print("No checkpoint found, starting from scratch")
+        fine_tuning.train()
+
+    pred_result, gold_result = [], []
+    score = fine_tuning.evaluate()
+    print(score)
+
+    # Save score
+    with open(f"{args.save_dir}/score.json", 'w') as f:
+        json.dump(score, f, indent=4)
+
+    generator = pipeline('text-generation', model=model, num_beams=5, do_sample=False,
+                         tokenizer=llama_tokenizer)
+    MAX_NEW_LENGTH = 128
+
+    # to no gradient
+    model.eval()
+
+    preds = []
+    for text in tqdm(test_data['text']):
+        pred = []
+        generated_texts = generator(
+            text, max_new_tokens=MAX_NEW_LENGTH, num_return_sequences=5)
+        # [0]['generated_text']
+        for generated_text in generated_texts:
+            generated_text = generated_text['generated_text']
+            s_idx = generated_text.find(
+                "### Dialogue State: ") + len("### Dialogue State: ")
+            e_idx = generated_text.find("[EOS]")
+            pred.append(str_to_dict(generated_text[s_idx:e_idx]))
+        preds.append(str_to_dict(generated_text[s_idx:e_idx]))
+
+    # save with gold
+    result = [
+        {'id': id,
+         'preds': p,
+         'gold': g}
+        for (id, p, g) in zip(test_data['id'], preds, test_data['output'])
+
+    ]
+    with open(f"{args.save_dir}/result.json", 'w') as f:
+        json.dump(result, f, indent=4)

@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.sh
+out/
+data/
+wandb/
 
 expts/
 data/
