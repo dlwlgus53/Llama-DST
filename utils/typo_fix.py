@@ -1,3 +1,4 @@
+
 def check_prefix_suffix(value, candidates):
     # add/delete "the" in the front, or the suffix in the end.
     if value in candidates:
@@ -20,6 +21,7 @@ def check_prefix_suffix(value, candidates):
                 return possible_value
     return ''
 
+
 def typo_fix(slot_values, ontology, version="2.1"):
 
     # fix the named entities in these slots
@@ -28,7 +30,6 @@ def typo_fix(slot_values, ontology, version="2.1"):
                           'restaurant-name', 'taxi-departure', 'taxi-destination', 'restaurant-food']
     fixed = {}
     for slot, value in slot_values.items():
-        # fix 's
         value = value.replace(' s ', 's ')
         if value.endswith(' s'):
             value = value[:-2] + 's'
@@ -47,7 +48,8 @@ def typo_fix(slot_values, ontology, version="2.1"):
                          'el shaddai': 'el shaddia',
                          'wendesday': 'wednesday',
                          'brazliian': 'brazilian',
-                         'graffton': 'grafton'}
+                         'graffton': 'grafton',
+                         'john s': 'johns'}
         for k, v in general_typos.items():
             value = value.replace(k, v)
 

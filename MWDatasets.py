@@ -62,8 +62,11 @@ class MWDataset:
         return prompt.replace("\n", " ")
 
     def as_dict(self, short=False):
+        print("id: ", self.turn_labels[3])
+        print("text: ", self.input_text[3])
+        print("label: ", self.states[3])
         if short:
-            return {'id': self.turn_labels[:10], 'text': self.input_text[:10], 'output': self.states[:10]}
+            return {'id': self.turn_labels[:5], 'text': self.input_text[:5], 'label': self.states[:5]}
         else:
             return {'id': self.turn_labels, 'text': self.input_text, 'label': self.states}
 

@@ -10,13 +10,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import numpy as np
 import json
 from transformers import EarlyStoppingCallback
-from transformers import pipeline
 from transformers.pipelines.pt_utils import KeyDataset
 import datasets
 import random
 from tqdm import tqdm
-from utils.typo_fix import typo_fix
 
+import evaluator
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_fn', type=str,
@@ -44,6 +43,9 @@ parser.add_argument('--save_step_num', type=int)
 parser.add_argument('--epoch_num', type=float)
 parser.add_argument('--turn_level', type=int, default=1)
 parser.add_argument('--short_testing', type=int, default=0)
+parser.add_argument('--beam_size', type=int, default=5)
+parser.add_argument('--mwz_ver', type=str, default="2.1",
+                    choices=['2.1', '2.4'], help="version of MultiWOZ")
 
 args = parser.parse_args()
 
@@ -105,21 +107,6 @@ def compute_metrics(p: EvalPrediction) -> dict:
     return {"perplexity": perplexity.item()}
 
 
-def str_to_dict(result):
-    result_dict = {}
-    dsv = result.split('[s]')
-    for dsv_item in dsv:
-        if len(dsv_item.strip()) == 0:
-            continue
-        else:
-            dsv_item = dsv_item.strip()
-            d, s, v = dsv_item.split(
-                '-')[0], dsv_item.split('-')[1], dsv_item.split('-')[2]
-            ds = d + '-' + s
-            result_dict[ds] = v
-    return result_dict
-
-
 if __name__ == "__main__":
     init_experiment(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -132,15 +119,15 @@ if __name__ == "__main__":
 
     Dataset = MWDataset_turn if args.turn_level else MWDataset_dial
 
-    train_data = MWDataset_turn(args.train_fn, 'train').as_dict()
+    train_data = Dataset(args.train_fn, 'train').as_dict()
     train_data = datasets.Dataset.from_dict(train_data)
     # train_loader = DataLoader(train_data, batch_size=4,
     #                           shuffle=False, collate_fn=train_data.collate_fn)
-    val_data = MWDataset_turn(args.val_fn, 'val').as_dict(
+    val_data = Dataset(args.val_fn, 'val').as_dict(
         short=args.short_testing)
     val_data = datasets.Dataset.from_dict(val_data)
 
-    test_data = MWDataset_turn(args.test_fn, 'test').as_dict(
+    test_data = Dataset(args.test_fn, 'test').as_dict(
         short=args.short_testing)
     test_data = datasets.Dataset.from_dict(test_data)
 
@@ -206,21 +193,22 @@ if __name__ == "__main__":
         load_best_model_at_end=True,
         evaluation_strategy="steps",
         run_name=args.save_dir,
-        report_to='wandb' if args.report else 'none'
+        report_to='wandb' if args.report else 'none',
+        prediction_loss_only=True,
+        save_total_limit=5
     )
 
     fine_tuning = SFTTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
-        compute_metrics=compute_metrics,
         peft_config=peft_parameters,
         dataset_text_field="text",
         tokenizer=llama_tokenizer,
         args=train_params,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
-
+    # compute_metrics=compute_metrics,
     # Training
     try:
         fine_tuning.train(resume_from_checkpoint=True)
@@ -228,7 +216,6 @@ if __name__ == "__main__":
         print("No checkpoint found, starting from scratch")
         fine_tuning.train()
 
-    pred_result, gold_result = [], []
     score = fine_tuning.evaluate()
     print(score)
 
@@ -236,34 +223,13 @@ if __name__ == "__main__":
     with open(f"{args.save_dir}/score.json", 'w') as f:
         json.dump(score, f, indent=4)
 
-    generator = pipeline('text-generation', model=model, num_beams=5, do_sample=False,
-                         tokenizer=llama_tokenizer)
-    MAX_NEW_LENGTH = 128
+    id, preds, labels = evaluator.run(args, test_data, model, llama_tokenizer)
 
-    # to no gradient
-    model.eval()
-
-    preds = []
-    for text in tqdm(test_data['text']):
-        pred = []
-        generated_texts = generator(
-            text, max_new_tokens=MAX_NEW_LENGTH, num_return_sequences=5)
-        # [0]['generated_text']
-        for generated_text in generated_texts:
-            generated_text = generated_text['generated_text']
-            s_idx = generated_text.find(
-                "### Dialogue State: ") + len("### Dialogue State: ")
-            e_idx = generated_text.find("[EOS]")
-            pred.append(str_to_dict(generated_text[s_idx:e_idx]))
-        preds.append(str_to_dict(generated_text[s_idx:e_idx]))
-
-    # save with gold
     result = [
         {'id': id,
-         'preds': p,
+         'pred': p,
          'gold': g}
-        for (id, p, g) in zip(test_data['id'], preds, test_data['output'])
-
+        for (id, p, g) in zip(id,  preds, labels)
     ]
-    with open(f"{args.save_dir}/result.json", 'w') as f:
+    with open(f"{args.save_dir}/raw_result.json", 'w') as f:
         json.dump(result, f, indent=4)
